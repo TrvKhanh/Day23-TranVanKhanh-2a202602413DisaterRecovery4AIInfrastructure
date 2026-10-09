@@ -1,23 +1,3 @@
-"""BƯỚC 3a — SINH VIÊN VIẾT. Health checker cho 2 region.
-
-Yêu cầu (đọc §4 "Kiến Trúc Health-Check-Based Failover" + §2 "DNS Failover"):
-  1. Poll /readyz của CẢ HAI region mỗi `interval` giây (mặc định 5s).
-     Dùng /readyz, KHÔNG dùng /healthz. /healthz chỉ nói "process còn sống" —
-     region có process sống nhưng vector DB rỗng thì vẫn không serve được.
-  2. Chỉ đổi trạng thái sau `threshold` lần fail LIÊN TIẾP (mặc định 3).
-     Một lần fail không phải outage. Đây là chống flapping (§4 Anti-Patterns).
-  3. Ghi 1 dòng JSONL MỖI LẦN ĐỔI TRẠNG THÁI (không ghi mỗi lần poll — log sẽ ngập).
-     Dòng bắt buộc có: ts, region, to (HEALTHY|UNHEALTHY), reason,
-     interval_s, threshold. Thiếu interval_s/threshold thì tools/measure_rto.py
-     không tính được detect floor -> mất điểm.
-
-Chạy:  python dr/health_checker.py --interval 5 --threshold 3 --duration 300 \
-              --out reports/health-events.jsonl
-
-CÂU HỎI PHẢI TRẢ LỜI TRƯỚC KHI VIẾT (ghi câu trả lời vào reports/postmortem.md):
-  interval=5s, threshold=3 -> sớm nhất bạn có thể phát hiện outage là bao nhiêu giây?
-  Con số đó nằm TRONG RTO của bạn. Muốn RTO 5 phút thì được phép chọn interval bao nhiêu?
-"""
 import argparse
 import json
 import pathlib
@@ -27,16 +7,60 @@ import httpx
 
 URL = {"a": "http://127.0.0.1:8001", "b": "http://127.0.0.1:8002"}
 
-
 def probe(region: str, timeout: float) -> tuple[bool, str]:
-    """TODO: trả về (ready, reason). Timeout PHẢI có — netblock làm request treo mãi."""
-    raise NotImplementedError
-
+    try:
+        r = httpx.get(f"{URL[region]}/readyz", timeout=timeout)
+        if r.status_code == 200:
+            return True, "ready"
+        else:
+            return False, f"status {r.status_code}"
+    except Exception as e:
+        return False, str(e)
 
 def run(interval: float, timeout: float, threshold: int, duration: float, out: pathlib.Path):
-    """TODO: vòng lặp poll + phát hiện transition + ghi JSONL."""
-    raise NotImplementedError
-
+    start_t = time.time()
+    state = {"a": "HEALTHY", "b": "HEALTHY"}
+    consecutive_fails = {"a": 0, "b": 0}
+    out.parent.mkdir(parents=True, exist_ok=True)
+    
+    with open(out, "a") as f:
+        while time.time() - start_t < duration:
+            for region in ["a", "b"]:
+                is_ready, reason = probe(region, timeout)
+                
+                if is_ready:
+                    consecutive_fails[region] = 0
+                    if state[region] == "UNHEALTHY":
+                        state[region] = "HEALTHY"
+                        ev = {
+                            "ts": time.time(),
+                            "event": "state_change",
+                            "region": region,
+                            "to": "HEALTHY",
+                            "reason": reason,
+                            "interval_s": interval,
+                            "threshold": threshold,
+                            "consecutive_fails": consecutive_fails[region]
+                        }
+                        f.write(json.dumps(ev) + "\n")
+                        f.flush()
+                else:
+                    consecutive_fails[region] += 1
+                    if consecutive_fails[region] >= threshold and state[region] == "HEALTHY":
+                        state[region] = "UNHEALTHY"
+                        ev = {
+                            "ts": time.time(),
+                            "event": "state_change",
+                            "region": region,
+                            "to": "UNHEALTHY",
+                            "reason": reason,
+                            "interval_s": interval,
+                            "threshold": threshold,
+                            "consecutive_fails": consecutive_fails[region]
+                        }
+                        f.write(json.dumps(ev) + "\n")
+                        f.flush()
+            time.sleep(interval)
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()

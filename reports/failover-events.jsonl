@@ -1,0 +1,5 @@
+{"ts": 1791565898.8852658, "iso": "2026-10-09T17:11:38Z", "step": "1_verify_target", "msg": "Verifying target b"}
+{"ts": 1791565898.914124, "iso": "2026-10-09T17:11:38Z", "step": "2_restore_snapshot", "msg": "Restoring snapshot", "rpo_seconds": 12.5, "docs_lost": 4, "embed_model_version": "embed-model=vi-e5-base@v3"}
+{"ts": 1791565898.9143257, "iso": "2026-10-09T17:11:38Z", "step": "3_scale_pool", "msg": "Scaling pool to full"}
+{"ts": 1791565898.914675, "iso": "2026-10-09T17:11:38Z", "step": "4_wait_ready", "msg": "Waiting for target to be ready"}
+{"ts": 1791565905.088035, "iso": "2026-10-09T17:11:45Z", "step": "5_dns_cutover", "msg": "Cutting over DNS to b"}

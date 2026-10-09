@@ -1,28 +1,3 @@
-"""BƯỚC 3c — SINH VIÊN VIẾT. Tự động hoá runbook §4 "Runbook: Region Chính Down".
-
-7 bước trên slide, mỗi bước 1 dòng log có ts. Log này CHÍNH LÀ timeline của postmortem.
-  1 xac_nhan_outage          — probe cả 2 region, đừng tin 1 lần fail (dùng nhiều lần
-                              hoặc gọi health_checker.probe nếu đã viết xong 3a)
-  2 thong_bao_incident       — ts của dòng này là mốc "operator biết tin", LUÔN LUÔN
-                              SAU t_outage trong chaos-events (không thể trùng — operator
-                              không thể biết ngay giây outage xảy ra). Ghi cả 2 ts vào
-                              log để postmortem tính được "độ trễ thông báo".
-  3 scale_gpu_pool           — gọi HÀM `failover.failover(...)` MỘT LẦN DUY NHẤT. Hàm
-                              đó tự làm đủ 5 bước con (verify/restore/scale/wait/cutover)
-                              và tự ghi log riêng vào reports/failover-events.jsonl.
-  4 verify_state_replica     — KHÔNG gọi lại failover — chỉ ĐỌC kết quả (vector count +
-                              weights ở region phụ) từ dict mà bước 3 trả về, để log vào
-                              runbook-run.jsonl cho postmortem đọc 1 chỗ duy nhất.
-  5 dns_cutover              — cũng chỉ đọc lại: kết quả cutover có ok hay không.
-  6 verify_golden_signals    — 10 request thật vào region phụ: p95 latency + error rate
-  7 post_incident            — elapsed_s + lệnh đo RTO
-
-BÁN TỰ ĐỘNG, KHÔNG FULL-AUTO (§4: "failover đầu tiên nên là bán tự động — alert +
-1-click confirm — tránh flapping gây failover 2 chiều liên tục"). Mặc định phải hỏi
-người vận hành confirm; --auto chỉ dùng trong CI/khi chấm điểm.
-
-Chạy:  python dr/runbook.py --primary a --target b --backend fs
-"""
 import argparse
 import json
 import pathlib
@@ -37,21 +12,98 @@ from dr import failover as fo  # noqa: E402
 LOG = pathlib.Path("reports/runbook-run.jsonl")
 URL = {"a": "http://127.0.0.1:8001", "b": "http://127.0.0.1:8002"}
 
-
 def step(n, name, **kw):
-    """TODO: ghi 1 dòng {ts, iso, step, name, ...} vào LOG."""
-    raise NotImplementedError
-
+    LOG.parent.mkdir(parents=True, exist_ok=True)
+    d = {"ts": time.time(), "iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "step": f"{n}_{name}"}
+    d.update(kw)
+    s = json.dumps(d)
+    with open(LOG, "a") as f:
+        f.write(s + "\n")
+    print(s)
 
 def confirm(auto: bool, msg: str) -> bool:
-    """TODO: auto=True -> True; ngược lại hỏi y/N. Đừng bỏ hàm này đi."""
-    raise NotImplementedError
-
+    if auto:
+        return True
+    try:
+        return input(f"{msg} [y/N]: ").strip().lower() == "y"
+    except EOFError:
+        return False
 
 def run(primary: str, target: str, backend: str, auto: bool) -> dict:
-    """TODO: 7 bước ở trên."""
-    raise NotImplementedError
+    # 1. xac_nhan_outage
+    step(1, "xac_nhan_outage", msg=f"Verifying outage on {primary}")
+    primary_down = False
+    for _ in range(3):
+        try:
+            r = httpx.get(f"{URL[primary]}/readyz", timeout=1.0)
+            if r.status_code != 200:
+                primary_down = True
+        except Exception:
+            primary_down = True
+        time.sleep(0.5)
+        
+    if not primary_down:
+        step(1, "xac_nhan_outage_status", msg=f"Primary {primary} is still up")
+        if not confirm(auto, "Primary seems up. Proceed anyway?"):
+            return {"ok": False, "reason": "primary_up_abort"}
+    else:
+        step(1, "xac_nhan_outage_status", msg=f"Primary {primary} confirmed DOWN")
+        
+    # 2. thong_bao_incident
+    t_outage = None
+    try:
+        lines = pathlib.Path("chaos/chaos-events.jsonl").read_text().splitlines()
+        for line in reversed(lines):
+            ev = json.loads(line)
+            if ev.get("action") == "kill":
+                t_outage = ev.get("ts")
+                break
+    except Exception:
+        pass
+    
+    alert_delay = time.time() - t_outage if t_outage else None
+    step(2, "thong_bao_incident", msg="Incident declared", t_outage=t_outage, alert_delay=alert_delay)
+    
+    if not confirm(auto, "Proceed with failover?"):
+        return {"ok": False, "reason": "operator_abort"}
 
+    # 3. scale_gpu_pool
+    step(3, "scale_gpu_pool", msg="Starting failover sub-process")
+    fo_res = fo.failover(target, backend, wait=60)
+    
+    # 4. verify_state_replica
+    step(4, "verify_state_replica", msg="State replica verified", target_state=fo_res.get("state", {}))
+    
+    # 5. dns_cutover
+    step(5, "dns_cutover", msg="DNS cutover verified", ok=fo_res.get("ok"), reason=fo_res.get("reason"))
+    
+    if not fo_res.get("ok"):
+        return {"ok": False, "reason": "failover_failed"}
+        
+    # 6. verify_golden_signals
+    step(6, "verify_golden_signals", msg="Running 10 requests to check latency and errors")
+    latencies = []
+    errors = 0
+    for _ in range(10):
+        t0 = time.time()
+        try:
+            r = httpx.post(f"{URL[target]}/v1/infer", json={"query": "test"}, timeout=2.0)
+            if r.status_code == 200:
+                latencies.append(time.time() - t0)
+            else:
+                errors += 1
+        except Exception:
+            errors += 1
+        time.sleep(0.1)
+        
+    p95 = sorted(latencies)[int(0.95 * len(latencies))] if latencies else None
+    error_rate = errors / 10.0
+    step(6, "verify_golden_signals_result", p95_latency=p95, error_rate=error_rate)
+    
+    # 7. post_incident
+    step(7, "post_incident", msg="Run measure_rto.py to verify")
+    
+    return {"ok": True, "target": target}
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
